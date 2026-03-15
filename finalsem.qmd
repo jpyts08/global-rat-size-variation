@@ -1,0 +1,491 @@
+---
+title: "Global Urban Rat Body Size Variation"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(lme4)
+library(MuMIn)
+library(ggrepel)
+library(performance)
+```
+
+# Load Data
+
+```{r load-data}
+gratsfeb <- read.csv("globalrats_feb_grades.csv")
+bioclim  <- read.csv("bioclimdata_sep25.csv")
+source("calculate_smi.R")
+```
+
+# Finalized Raw Data
+
+```{r finalized-raw}
+# Remove excluded cities/individuals; standardize age classes and city names
+gratsfebfin <- gratsfeb |>
+  filter(
+    !(city %in% c("Tarlac", "Sihanouk", "Mondolkiri", "Ratchaburi")),
+    Rat_ID != "24R-116",
+    !Rat_ID %in% c("153", "557", "ED02", "ND1287"),
+    !UR.ID %in% c("Rat8546", "Rat8545"),
+    city != "Helsinki" | condition %in% c("live", "kill")
+  ) |>
+  mutate(
+    id = row_number(),
+    grams = as.numeric(grams),
+    # Collapse age classes into Adult / Non-Adult / Unknown
+    second_age = case_when(
+      age %in% c("Juvenile", "Subadult", "Nonadult", "Non-Adult") ~ "Non-Adult",
+      age %in% c("Adult", "gravid", "lact", "lactating", "mat",
+                 "scars", "7 fetuses")                            ~ "Adult",
+      TRUE                                                        ~ "Unknown"),
+    # Rename NYC sub-sites
+    city = case_when(
+      city == "NYC1" ~ "NYC_Firth",
+      city == "NYC2" ~ "NYC_Combs",
+      TRUE           ~ city),
+    # Correct three Boston individuals miscategorised as Non-Adult
+    across(c(age, second_age),
+      ~if_else(city == "Boston" & second_age == "Non-Adult" &
+               Rat_ID %in% c("2021-25", "2022-91", "2021-52"), "Adult", .x))
+  )
+```
+
+# Grade City Lists
+
+```{r grade-lists}
+# Gold cities: highest data-quality tier
+gold_cities <- c("Vancouver_CH", "Boston", "Helsinki", "Salvador", "Chicago",
+                 "Vienna", "Richmond", "Oakland", "Sacramento", "DC",
+                 "San Diego", "LA")
+
+# Silver cities: second-tier data quality
+silver_cities <- c("Kuching", "NYC_Firth", "Vancouver_KB",
+                   "Buenos Aires", "Singapore")
+
+# Bronze cities: third-tier; require interpolated adult cutoffs
+bronze_cities <- c("Auckland", "NYC_Combs", "Amsterdam", "Rotterdam",
+                   "New Orleans", "Paris", "Barcelona", "Valencia",
+                   "Tokyo", "Wellington")
+```
+
+# SMI Calculation
+
+```{r smi}
+# Body length already standardised to mm in uofm_gsbrcombo_feb_intrp
+# SMI computed via calculate_smi.R sourced above
+# smi_gsbrrnadult_feb is available after sourcing calculate_smi.R
+```
+
+---
+
+# DELIVERABLE 1 — Sex Ratio for Gold & Silver *Rattus rattus* Adults
+
+```{r sex-ratio}
+# ── Filter to Rr adults from Gold and Silver cities ──────────────────────────
+sex_ratio_rr <- gratsfebfin |>
+  filter(
+    species    == "Rr",
+    second_age == "Adult",
+    city %in% c(gold_cities, silver_cities),
+    sex %in% c("M", "F")
+  ) |>
+  # Count M/F per city, carrying grade along
+  group_by(city, grade, sex) |>
+  summarise(n = n(), .groups = "drop") |>
+  # Compute percent within each city
+  group_by(city) |>
+  mutate(
+    total   = sum(n),
+    percent = round(n / total * 100, 1)
+  ) |>
+  ungroup()
+
+# Flag the dominant sex in each city
+sex_ratio_rr <- sex_ratio_rr |>
+  group_by(city) |>
+  mutate(dominant = sex[which.max(percent)]) |>
+  ungroup()
+
+sex_ratio_rr
+```
+
+```{r sex-ratio-plot}
+# Stacked bar: % male vs female, faceted by grade
+ggplot(sex_ratio_rr, aes(x = reorder(city, percent), y = percent, fill = sex)) +
+  geom_col(position = "stack") +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~grade, scales = "free_x") +
+  scale_fill_manual(values = c("M" = "#4E79A7", "F" = "#F28E2B"),
+                    labels = c("M" = "Male", "F" = "Female")) +
+  labs(title    = "Sex Ratio of Adult Rr — Gold & Silver Cities",
+       x        = NULL,
+       y        = "Percent (%)",
+       fill     = "Sex") +
+  coord_flip() +
+  theme_bw()
+```
+
+---
+
+# DELIVERABLE 2 — Sex-Specific Analysis Setup
+
+All subsequent analyses are run **separately for Males and Females**.
+
+```{r sex-split}
+# Convenience filtered subsets reused in later deliverables
+# Gold + Silver Rr adults — male
+gs_rr_adult_male <- gratsfebfin |>
+  filter(
+    species    == "Rr",
+    second_age == "Adult",
+    city %in% c(gold_cities, silver_cities),
+    sex == "M",
+    !is.na(grams),
+    !is.na(bio1)
+  )
+
+# Gold + Silver Rr adults — female
+gs_rr_adult_female <- gratsfebfin |>
+  filter(
+    species    == "Rr",
+    second_age == "Adult",
+    city %in% c(gold_cities, silver_cities),
+    sex == "F",
+    !is.na(grams),
+    !is.na(bio1)
+  )
+```
+
+---
+
+# DELIVERABLE 3 — Rr Line of Best Fit (Gold + Silver), Bronze Classification
+
+## 3a. Rn Reference (existing approach — preserved exactly)
+
+```{r rn-lobf-reference, eval=FALSE}
+# Existing Rn pipeline (shown for reference; sg_rnadult_hsum_feb already built)
+# sg_rnadult_hsum_feb: city-level summary with min_weight ~ bio1
+# lm_rn  <- lm(min_weight ~ bio1, data = sg_rnadult_hsum_feb)
+# pred_rn <- predict(lm_rn, newdata = sg_rnadult_hsum_feb)
+# (plot with geom_text_repel; equation extracted from coef(lm_rn))
+```
+
+## 3b. Rr LOBF — city-level min weight summary
+
+```{r rr-lobf-summary}
+# Summarise minimum adult weight per city (bio1 fixed within city)
+sg_rradult_hsum_feb_male <- gs_rr_adult_male |>
+  group_by(city, bio1) |>
+  summarise(
+    min_weight = min(grams, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  )
+
+sg_rradult_hsum_feb_female <- gs_rr_adult_female |>
+  group_by(city, bio1) |>
+  summarise(
+    min_weight = min(grams, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  )
+```
+
+## 3c. Rr LM — min weight ~ bio1
+
+```{r rr-lobf-lm}
+# Male LOBF
+lm_rr_male   <- lm(min_weight ~ bio1, data = sg_rradult_hsum_feb_male)
+lm_rr_male_coef <- coef(lm_rr_male)
+
+# Female LOBF
+lm_rr_female <- lm(min_weight ~ bio1, data = sg_rradult_hsum_feb_female)
+lm_rr_female_coef <- coef(lm_rr_female)
+
+# Print equations
+cat("Male   Rr LOBF: min_weight =",
+    round(lm_rr_male_coef["(Intercept)"], 3), "+",
+    round(lm_rr_male_coef["bio1"], 3), "* bio1\n")
+
+cat("Female Rr LOBF: min_weight =",
+    round(lm_rr_female_coef["(Intercept)"], 3), "+",
+    round(lm_rr_female_coef["bio1"], 3), "* bio1\n")
+
+summary(lm_rr_male)
+summary(lm_rr_female)
+```
+
+## 3d. LOBF Plots
+
+```{r rr-lobf-plot-male}
+# Predict fitted line for males
+sg_rradult_hsum_feb_male <- sg_rradult_hsum_feb_male |>
+  mutate(pred_min_weight = predict(lm_rr_male, newdata = sg_rradult_hsum_feb_male))
+
+ggplot(sg_rradult_hsum_feb_male, aes(x = bio1, y = min_weight)) +
+  geom_point(size = 2, colour = "#4E79A7") +
+  geom_line(aes(y = pred_min_weight), colour = "red", linewidth = 0.8) +
+  geom_text_repel(aes(label = city), size = 3) +
+  labs(
+    title = "Rr Male — Min Adult Weight vs Mean Annual Temperature\n(Gold + Silver Cities)",
+    x     = "Bio1 (Mean Annual Temp × 10, °C)",
+    y     = "Minimum Adult Weight (g)"
+  ) +
+  theme_bw()
+```
+
+```{r rr-lobf-plot-female}
+# Predict fitted line for females
+sg_rradult_hsum_feb_female <- sg_rradult_hsum_feb_female |>
+  mutate(pred_min_weight = predict(lm_rr_female, newdata = sg_rradult_hsum_feb_female))
+
+ggplot(sg_rradult_hsum_feb_female, aes(x = bio1, y = min_weight)) +
+  geom_point(size = 2, colour = "#F28E2B") +
+  geom_line(aes(y = pred_min_weight), colour = "red", linewidth = 0.8) +
+  geom_text_repel(aes(label = city), size = 3) +
+  labs(
+    title = "Rr Female — Min Adult Weight vs Mean Annual Temperature\n(Gold + Silver Cities)",
+    x     = "Bio1 (Mean Annual Temp × 10, °C)",
+    y     = "Minimum Adult Weight (g)"
+  ) +
+  theme_bw()
+```
+
+## 3e. Apply Rr LOBF to Bronze — Interpolated Adult Cutoff
+
+```{r bronze-rr-cutoff}
+# Apply male and female LOBF equations to bronze Rr individuals
+# to derive a city-specific predicted minimum adult weight, then
+# classify each individual as Adult or Non-Adult against that threshold.
+
+bronze_rr_raw <- gratsfebfin |>
+  filter(
+    species == "Rr",
+    city %in% bronze_cities,
+    !is.na(grams),
+    !is.na(bio1),
+    sex %in% c("M", "F")
+  ) |>
+  mutate(
+    # Predicted min weight uses sex-specific equation
+    predminweight_rr = case_when(
+      sex == "M" ~ lm_rr_male_coef["(Intercept)"]   + lm_rr_male_coef["bio1"]   * bio1,
+      sex == "F" ~ lm_rr_female_coef["(Intercept)"] + lm_rr_female_coef["bio1"] * bio1
+    ),
+    # Classify: Adult if weight >= predicted cutoff
+    gsbr_ageclass_rr = if_else(grams >= predminweight_rr, "Adult", "Non-Adult")
+  )
+
+# Final bronze Rr dataframe — adults only, mirroring br_feb_final structure
+br_rr_feb_final <- bronze_rr_raw |>
+  filter(gsbr_ageclass_rr == "Adult")
+
+cat("Bronze Rr adults (male)  :", sum(br_rr_feb_final$sex == "M"), "\n")
+cat("Bronze Rr adults (female):", sum(br_rr_feb_final$sex == "F"), "\n")
+```
+
+---
+
+# DELIVERABLE 4 — LMEM: Rr Body Mass ~ Bio1 + (1 | city)
+
+## 4a. Model A — Gold + Silver Only
+
+```{r lmem-model-a}
+# ── Male ─────────────────────────────────────────────────────────────────────
+lmer_rr_gs_male <- lmer(grams ~ bio1 + (1 | city), data = gs_rr_adult_male,
+                        REML = FALSE)
+summary(lmer_rr_gs_male)
+r.squaredGLMM(lmer_rr_gs_male)
+
+# ── Female ────────────────────────────────────────────────────────────────────
+lmer_rr_gs_female <- lmer(grams ~ bio1 + (1 | city), data = gs_rr_adult_female,
+                          REML = FALSE)
+summary(lmer_rr_gs_female)
+r.squaredGLMM(lmer_rr_gs_female)
+```
+
+### Model A Prediction Plots
+
+```{r lmem-a-plot-male}
+# City-level label positions: mean bio1 & mean grams per city
+city_labels_gs_male <- gs_rr_adult_male |>
+  group_by(city) |>
+  summarise(bio1  = mean(bio1,  na.rm = TRUE),
+            grams = mean(grams, na.rm = TRUE),
+            .groups = "drop")
+
+# Population-level prediction (re.form = NA)
+pred_gs_male <- gs_rr_adult_male |>
+  mutate(fit = predict(lmer_rr_gs_male, newdata = gs_rr_adult_male,
+                       re.form = NA))
+
+ggplot(pred_gs_male, aes(x = bio1, y = grams)) +
+  geom_jitter(width = 0.3, alpha = 0.35, colour = "#4E79A7", size = 1.2) +
+  geom_line(aes(y = fit), colour = "red", linewidth = 1) +
+  geom_text_repel(data = city_labels_gs_male,
+                  aes(label = city), size = 2.8, colour = "grey30") +
+  labs(
+    title = "Model A — Rr Male: Grams ~ Bio1 (Gold + Silver Cities)",
+    x     = "Bio1 (Mean Annual Temp × 10, °C)",
+    y     = "Body Mass (g)"
+  ) +
+  theme_bw()
+```
+
+```{r lmem-a-plot-female}
+city_labels_gs_female <- gs_rr_adult_female |>
+  group_by(city) |>
+  summarise(bio1  = mean(bio1,  na.rm = TRUE),
+            grams = mean(grams, na.rm = TRUE),
+            .groups = "drop")
+
+pred_gs_female <- gs_rr_adult_female |>
+  mutate(fit = predict(lmer_rr_gs_female, newdata = gs_rr_adult_female,
+                       re.form = NA))
+
+ggplot(pred_gs_female, aes(x = bio1, y = grams)) +
+  geom_jitter(width = 0.3, alpha = 0.35, colour = "#F28E2B", size = 1.2) +
+  geom_line(aes(y = fit), colour = "red", linewidth = 1) +
+  geom_text_repel(data = city_labels_gs_female,
+                  aes(label = city), size = 2.8, colour = "grey30") +
+  labs(
+    title = "Model A — Rr Female: Grams ~ Bio1 (Gold + Silver Cities)",
+    x     = "Bio1 (Mean Annual Temp × 10, °C)",
+    y     = "Body Mass (g)"
+  ) +
+  theme_bw()
+```
+
+## 4b. Model B — Gold + Silver + Bronze (Interpolated)
+
+```{r lmem-model-b-data}
+# Combine Gold/Silver adults with interpolated Bronze Rr adults
+gs_rr_adult_male_full <- gs_rr_adult_male |>
+  mutate(source = "gold_silver")
+
+br_rr_male <- br_rr_feb_final |>
+  filter(sex == "M") |>
+  mutate(source = "bronze")
+
+br_rr_female <- br_rr_feb_final |>
+  filter(sex == "F") |>
+  mutate(source = "bronze")
+
+gs_rr_adult_female_full <- gs_rr_adult_female |>
+  mutate(source = "gold_silver")
+
+# Full male dataset
+rr_adult_male_full <- bind_rows(gs_rr_adult_male_full, br_rr_male)
+
+# Full female dataset
+rr_adult_female_full <- bind_rows(gs_rr_adult_female_full, br_rr_female)
+```
+
+```{r lmem-model-b}
+# ── Male ──────────────────────────────────────────────────────────────────────
+lmer_rr_gsb_male <- lmer(grams ~ bio1 + (1 | city), data = rr_adult_male_full,
+                         REML = FALSE)
+summary(lmer_rr_gsb_male)
+r.squaredGLMM(lmer_rr_gsb_male)
+
+# ── Female ────────────────────────────────────────────────────────────────────
+lmer_rr_gsb_female <- lmer(grams ~ bio1 + (1 | city), data = rr_adult_female_full,
+                           REML = FALSE)
+summary(lmer_rr_gsb_female)
+r.squaredGLMM(lmer_rr_gsb_female)
+```
+
+### Model B Prediction Plots
+
+```{r lmem-b-plot-male}
+# City-level labels across all three tiers
+city_labels_gsb_male <- rr_adult_male_full |>
+  group_by(city, source) |>
+  summarise(bio1  = mean(bio1,  na.rm = TRUE),
+            grams = mean(grams, na.rm = TRUE),
+            .groups = "drop")
+
+pred_gsb_male <- rr_adult_male_full |>
+  mutate(fit = predict(lmer_rr_gsb_male, newdata = rr_adult_male_full,
+                       re.form = NA))
+
+ggplot(pred_gsb_male, aes(x = bio1, y = grams, colour = source)) +
+  geom_jitter(width = 0.3, alpha = 0.35, size = 1.2) +
+  geom_line(aes(y = fit), colour = "red", linewidth = 1) +
+  geom_text_repel(data = city_labels_gsb_male,
+                  aes(label = city), size = 2.8, colour = "grey30") +
+  scale_colour_manual(values = c("gold_silver" = "#4E79A7",
+                                 "bronze"      = "#59A14F"),
+                      labels = c("gold_silver" = "Gold/Silver",
+                                 "bronze"      = "Bronze (interpolated)")) +
+  labs(
+    title  = "Model B — Rr Male: Grams ~ Bio1 (All Cities)",
+    x      = "Bio1 (Mean Annual Temp × 10, °C)",
+    y      = "Body Mass (g)",
+    colour = "Data Tier"
+  ) +
+  theme_bw()
+```
+
+```{r lmem-b-plot-female}
+city_labels_gsb_female <- rr_adult_female_full |>
+  group_by(city, source) |>
+  summarise(bio1  = mean(bio1,  na.rm = TRUE),
+            grams = mean(grams, na.rm = TRUE),
+            .groups = "drop")
+
+pred_gsb_female <- rr_adult_female_full |>
+  mutate(fit = predict(lmer_rr_gsb_female, newdata = rr_adult_female_full,
+                       re.form = NA))
+
+ggplot(pred_gsb_female, aes(x = bio1, y = grams, colour = source)) +
+  geom_jitter(width = 0.3, alpha = 0.35, size = 1.2) +
+  geom_line(aes(y = fit), colour = "red", linewidth = 1) +
+  geom_text_repel(data = city_labels_gsb_female,
+                  aes(label = city), size = 2.8, colour = "grey30") +
+  scale_colour_manual(values = c("gold_silver" = "#F28E2B",
+                                 "bronze"      = "#E15759"),
+                      labels = c("gold_silver" = "Gold/Silver",
+                                 "bronze"      = "Bronze (interpolated)")) +
+  labs(
+    title  = "Model B — Rr Female: Grams ~ Bio1 (All Cities)",
+    x      = "Bio1 (Mean Annual Temp × 10, °C)",
+    y      = "Body Mass (g)",
+    colour = "Data Tier"
+  ) +
+  theme_bw()
+```
+
+## 4c. Model Comparison Summary
+
+```{r model-comparison}
+# Compare marginal and conditional R² across models
+tibble(
+  Model   = c("A Male", "A Female", "B Male", "B Female"),
+  Dataset = c("Gold+Silver", "Gold+Silver", "Gold+Silver+Bronze", "Gold+Silver+Bronze"),
+  Sex     = c("M", "F", "M", "F"),
+  R2m     = c(r.squaredGLMM(lmer_rr_gs_male)[1,   "R2m"],
+              r.squaredGLMM(lmer_rr_gs_female)[1,  "R2m"],
+              r.squaredGLMM(lmer_rr_gsb_male)[1,   "R2m"],
+              r.squaredGLMM(lmer_rr_gsb_female)[1, "R2m"]),
+  R2c     = c(r.squaredGLMM(lmer_rr_gs_male)[1,   "R2c"],
+              r.squaredGLMM(lmer_rr_gs_female)[1,  "R2c"],
+              r.squaredGLMM(lmer_rr_gsb_male)[1,   "R2c"],
+              r.squaredGLMM(lmer_rr_gsb_female)[1, "R2c"])
+) |>
+  mutate(across(c(R2m, R2c), ~round(.x, 3)))
+```
